@@ -25,6 +25,9 @@ export default defineConfig(({ mode }) => {
       },
     },
     preview: { port: Number(env.PORT) || 3000, strictPort: true },
+    // jsdom gives the tests localStorage and DOM globals, which the api
+    // module's tokenStore needs.
+    test: { environment: 'jsdom', include: ['src/**/*.test.{js,jsx}'] },
     build: {
       outDir: 'dist',
       sourcemap: mode !== 'production',

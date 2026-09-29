@@ -1,0 +1,14 @@
+todolist.txt
+
+# Dependencies
+node_modules/
+.venv/
+venv/
+
+# Build output
+dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+

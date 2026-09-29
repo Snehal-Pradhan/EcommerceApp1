@@ -10,5 +10,8 @@ export default defineConfig(({ mode }) => {
       '/api': { target: apiTarget, changeOrigin: true },
     } },
     build: { outDir: 'dist', sourcemap: mode !== 'production' },
+    // jsdom gives the tests localStorage and DOM globals, which the api
+    // module's tokenStore needs.
+    test: { environment: 'jsdom', include: ['src/**/*.test.{js,jsx}'] },
   };
 });
