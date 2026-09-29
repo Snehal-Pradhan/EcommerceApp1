@@ -1,0 +1,72 @@
+# Rendered at container start into /etc/nginx/conf.d/default.conf, replacing
+# every ${VAR} with an environment value. No localhost fallback: an unset
+# BACKEND_HOST should fail the boot loudly, not serve 502s that look like an
+# application bug.
+
+upstream backend_upstream {
+    server ${BACKEND_HOST}:${BACKEND_PORT};
+}
+
+server {
+    listen 8080;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+    server_tokens off;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    gzip on;
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+    gzip_min_length 1024;
+
+    # Hashed filenames, safe to cache indefinitely. `expires` is avoided because
+    # it emits a second, conflicting Cache-Control header.
+    location /assets/ {
+        add_header Cache-Control "public, max-age=31536000, immutable";
+    }
+
+    location = /index.html {
+        add_header Cache-Control "no-store, must-revalidate";
+    }
+
+    # Deep links are routes, not files.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /api/ {
+        proxy_pass http://backend_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 30s;
+    }
+
+    # The API's own probes, forwarded so they are reachable through the front
+    # door. A load balancer or a post-deploy check in front of this container can
+    # then ask whether the whole path works, not just this container.
+    #
+    # Distinct from /healthz below, which is nginx answering alone. /healthz
+    # must never depend on the API: a health check that fails on a dependency
+    # restarts healthy containers during an outage.
+    location = /health {
+        proxy_pass http://backend_upstream/health;
+    }
+
+    location = /ready {
+        proxy_pass http://backend_upstream/ready;
+    }
+
+    # Answered from this config, no upstream involved.
+    location = /healthz {
+        access_log off;
+        add_header Content-Type text/plain;
+        return 200 "ok\n";
+    }
+}

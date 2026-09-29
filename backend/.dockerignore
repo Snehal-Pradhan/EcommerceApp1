@@ -1,0 +1,33 @@
+# The virtualenv holds host-machine paths and binaries. Copying it in would be
+# both wrong and large.
+.venv
+venv
+
+# Never let host __pycache__ or .pyc files reach the image - they are
+# architecture-specific and will not match the runtime interpreter.
+__pycache__
+*.py[cod]
+
+# Tooling caches
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+
+# Tests are run by CI against the same image contents, not shipped inside it.
+tests
+
+# Secrets. Only *.example templates belong in version control.
+.env
+.env.*
+!.env.example
+
+uploads
+*.log
+*.pid
+
+.git
+.DS_Store
+Dockerfile
+.dockerignore

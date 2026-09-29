@@ -1,0 +1,116 @@
+# docker compose up -d --build
+#
+# This replaces six long `docker run` commands with one declaration. The
+# interesting part is not the shorthand - it is the three things that were
+# previously manual and are now guaranteed:
+#
+#   1. Service names ARE the DNS names. `api`, `db`, `redis` resolve on an
+#      implicit network compose creates for you. No IPs anywhere.
+#   2. Startup order is enforced by health, not by hope. `depends_on` with a
+#      condition waits until a service is genuinely usable, not merely started.
+#   3. Only the two services a browser needs publish ports. The database and
+#      API are unreachable from outside this host.
+
+name: store
+
+services:
+  # ------------------------------------------------------------- database --
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: store
+      POSTGRES_PASSWORD: store
+      POSTGRES_DB: store
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    # The stock postgres image has no healthcheck, so one is declared here.
+    # pg_isready answers only once the server accepts connections - which is
+    # genuinely later than "the container started".
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U store -d store"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- cache --
+  redis:
+    image: redis:7-alpine
+    # Cache only, so there is nothing worth persisting.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ------------------------------------------------------------ seed data --
+  # A one-shot job: creates the schema and inserts demo data, then exits.
+  # Idempotent, so it is safe on every `up`. It is a service, not a step.
+  seed:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://store:store@db:5432/store
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+    command: ["python", "-m", "app.seed"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  # ------------------------------------------------------------------ api --
+  api:
+    build: ./backend
+    image: store/api:${IMAGE_TAG:-latest}
+    environment:
+      DATABASE_URL: postgresql+psycopg://store:store@db:5432/store
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    depends_on:
+      # Wait for the schema to exist, not just for the database to be up. This
+      # is the condition that stops the API crash-looping on first boot.
+      seed:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    # No `ports`. The API is reachable as `api:8000` from the network and from
+    # nowhere else. Publishing it would expose it to the host and the internet.
+    # Its healthcheck comes from the image, so every environment inherits it.
+    restart: unless-stopped
+
+  # ------------------------------------------------------------- storefront --
+  frontend:
+    build: ./frontend
+    image: store/frontend:${IMAGE_TAG:-latest}
+    environment:
+      # The service name is the hostname. No DNS server to configure, no IP to
+      # discover, and it stays correct if the api container is replaced.
+      BACKEND_HOST: api
+      BACKEND_PORT: "8000"
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "3000:8080"
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------- admin --
+  admin:
+    build: ./admin
+    image: store/admin:${IMAGE_TAG:-latest}
+    environment:
+      BACKEND_HOST: api
+      BACKEND_PORT: "8000"
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "5173:8080"
+    restart: unless-stopped
+
+volumes:
+  db_data:

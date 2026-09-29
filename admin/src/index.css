@@ -1,0 +1,76 @@
+@import 'tailwindcss';
+
+/*
+ * Tailwind v4 is CSS-first: the theme is declared here with @theme rather than
+ * in a tailwind.config.js file, and reusable classes are declared with
+ * @utility so they become real utilities that @apply can reference.
+ */
+@theme {
+  --color-brand-50: oklch(0.97 0.014 254.6);
+  --color-brand-100: oklch(0.932 0.032 255.5);
+  --color-brand-200: oklch(0.882 0.059 254.1);
+  --color-brand-300: oklch(0.809 0.105 251.8);
+  --color-brand-400: oklch(0.707 0.165 254.6);
+  --color-brand-500: oklch(0.623 0.214 259.8);
+  --color-brand-600: oklch(0.546 0.245 262.9);
+  --color-brand-700: oklch(0.488 0.243 264.4);
+  --color-brand-800: oklch(0.424 0.199 265.6);
+  --color-brand-900: oklch(0.379 0.146 265.5);
+
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased;
+    font-family: var(--font-sans);
+  }
+
+  /* Respect users who have asked the OS to reduce motion. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@utility btn {
+  @apply inline-flex cursor-pointer items-center justify-center gap-2 rounded-lg px-4 py-2
+         text-sm font-semibold no-underline transition-colors
+         focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600
+         disabled:cursor-not-allowed disabled:opacity-50;
+}
+
+@utility btn-primary {
+  @apply btn bg-brand-600 text-white hover:bg-brand-700 active:bg-brand-800;
+}
+
+@utility btn-secondary {
+  @apply btn border border-slate-300 bg-white text-slate-700 hover:bg-slate-50;
+}
+
+@utility btn-danger {
+  @apply btn bg-rose-600 text-white hover:bg-rose-700;
+}
+
+@utility input {
+  @apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm
+         text-slate-900 placeholder:text-slate-400
+         focus:border-brand-500 focus:ring-2 focus:ring-brand-200 focus:outline-none;
+}
+
+@utility card {
+  @apply rounded-xl border border-slate-200 bg-white shadow-sm;
+}
+
+@utility badge {
+  @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium;
+}
