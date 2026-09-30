@@ -106,7 +106,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.app }}
 
       - name: Scan image for CVEs
-        uses: aquasecurity/trivy-action@0.33.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.app }}:sha-${{ github.sha }}
           severity: CRITICAL
@@ -194,7 +194,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=backend
 
       - name: Scan image for CVEs
-        uses: aquasecurity/trivy-action@0.33.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ vars.DOCKERHUB_USERNAME }}/backend:sha-${{ github.sha }}
           severity: CRITICAL
