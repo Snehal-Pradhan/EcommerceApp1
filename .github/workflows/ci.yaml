@@ -72,22 +72,6 @@ jobs:
     defaults:
       run:
         working-directory: backend
-    # The suite runs against a real PostgreSQL, not SQLite, so CI needs a
-    # database. The env values here match the defaults in tests/conftest.py.
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: store
-          POSTGRES_PASSWORD: store
-          POSTGRES_DB: store_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -124,19 +108,6 @@ jobs:
       - name: Fail if linting failed
         if: steps.lint.outputs.result == 'fail'
         run: exit 1
-
-      - name: Wait for PostgreSQL
-        run: |
-          for i in $(seq 1 30); do
-            if pg_isready -h localhost -p 5432 -U store; then
-              echo "PostgreSQL is ready"
-              exit 0
-            fi
-            echo "Waiting for PostgreSQL ($i/30)"
-            sleep 2
-          done
-          echo "::error::PostgreSQL did not become ready in time"
-          exit 1
 
       - name: Test (pytest)
         run: pytest
