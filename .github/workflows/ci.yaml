@@ -81,6 +81,9 @@ jobs:
       - name: Docker build
         uses: docker/build-push-action@v6
         with:
+          # type=gha cache export requires the docker-container driver; the
+          # default docker driver cannot export a cache.
+          driver: docker-container
           context: ${{ matrix.app }}
           push: true
           tags: |
@@ -148,6 +151,9 @@ jobs:
       - name: Docker build
         uses: docker/build-push-action@v6
         with:
+          # type=gha cache export requires the docker-container driver; the
+          # default docker driver cannot export a cache.
+          driver: docker-container
           context: backend
           push: true
           tags: |
