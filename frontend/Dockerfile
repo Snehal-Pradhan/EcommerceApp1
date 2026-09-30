@@ -1,19 +1,37 @@
 # syntax=docker/dockerfile:1
 #
-# Structurally identical to admin/Dockerfile: a Vite + React app compiles to
-# static files, so the runtime is nginx and carries no Node. The only differences
-# are the label and which source directory is copied.
+# EXPERIMENT: hardened runtime. The nginx stage uses a Chainguard (Wolfi) image:
+# no shell, no wget, runs as non-root 65532, near-zero CVE surface.
 #
-# The duplication is deliberate for now - two readable Dockerfiles beat one
-# parameterised one while you are still learning what the parts do. Once both are
-# stable the real fix is a shared base image or a single root Dockerfile with
-# build args, not copy-paste that drifts.
+# What that costs, and why this Dockerfile diverges from admin/Dockerfile:
+#
+#   1. No shell means no envsubst entrypoint, so the config cannot be rendered
+#      at container start. It is rendered at BUILD time instead (in the builder
+#      stage, which still has a shell), from the same nginx.conf.template. The
+#      consequence: the backend address is baked in, so this image is bound to
+#      the compose network's service name. The runtime BACKEND_HOST/BACKEND_PORT
+#      environment variables are ignored by this image.
+#   2. No wget means no in-image HEALTHCHECK. Health moves to the platform
+#      (compose can declare its own healthcheck if needed).
+#   3. No RUN is possible in the runtime stage at all - there is no shell to run
+#      it with. The image ships pre-writable log and pid paths for uid 65532.
+#   4. The rendered config overwrites the image's own
+#      /etc/nginx/conf.d/nginx.default.conf rather than adding a second file:
+#      both listen on 8080, and nginx refuses to start on a duplicate listen.
+#
+#   5. cgr.dev/chainguard/nginx:latest is a MUTABLE tag - the free tier offers
+#      nothing else, which conflicts with the pinned-versions discipline used
+#      everywhere else in this repo. That is the real price of the free tier.
 
 ARG NODE_IMAGE=node:22.23.3-alpine3.24
-ARG NGINX_IMAGE=nginx:1.31.2-alpine
+ARG NGINX_IMAGE=cgr.dev/chainguard/nginx:latest
 
 # ----------------------------------------------------------------- builder --
 FROM ${NODE_IMAGE} AS builder
+
+# Baked at build time because the hardened runtime has no shell to render with.
+# Default matches the compose network's service name.
+ARG BACKEND_ADDR=api:8000
 
 WORKDIR /app
 
@@ -26,29 +44,28 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
+# Render the server config from the template. The upstream line is rewritten
+# wholesale (line after the upstream block) so the template's placeholders never
+# appear in the sed program. Double quotes matter: BuildKit does not substitute
+# ${ARG} inside single-quoted segments.
+RUN sed -E "/upstream backend_upstream/{n;s|.*|    server ${BACKEND_ADDR};|}" \
+      nginx.conf.template > nginx.default.conf \
+ && grep -q "server ${BACKEND_ADDR};" nginx.default.conf
+
 # ----------------------------------------------------------------- runtime --
 FROM ${NGINX_IMAGE} AS runtime
 
 LABEL org.opencontainers.image.title="store-frontend" \
-      org.opencontainers.image.description="Storefront: static bundle served by nginx" \
+      org.opencontainers.image.description="Storefront: static bundle served by hardened nginx" \
       org.opencontainers.image.source="https://github.com/Snehal-Pradhan/Ecom-demo-app"
 
-COPY --from=builder --chown=nginx:nginx /app/dist /usr/share/nginx/html
+COPY --from=builder /app/dist /usr/share/nginx/html
 
-# Rendered at container start, so one image works in any environment.
-COPY nginx.conf.template /etc/nginx/templates/default.conf.template
-ENV NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx/conf.d
+# Same filename as the image's own default server, so it replaces it instead of
+# colliding on listen 8080.
+COPY --from=builder /app/nginx.default.conf /etc/nginx/conf.d/nginx.default.conf
 
-# chown must precede USER; the config dir is written by the entrypoint.
-RUN touch /var/run/nginx.pid \
- && chown -R nginx:nginx /var/run/nginx.pid /var/cache/nginx /var/log/nginx /etc/nginx/conf.d
-
-USER nginx
 EXPOSE 8080
 
-# Hits /healthz, which nginx answers without the backend. Checking the API here
-# would restart healthy containers during a dependency outage.
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1
-
-CMD ["nginx", "-g", "daemon off;"]
+# No USER (the image already runs as 65532), no HEALTHCHECK (no wget), and no
+# CMD/ENTRYPOINT: the image's own `nginx -c /etc/nginx/nginx.conf ...` is used.
