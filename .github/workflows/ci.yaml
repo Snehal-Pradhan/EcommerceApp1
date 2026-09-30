@@ -1,13 +1,11 @@
-# Phase 1 — CI: checks, then image publishing.
+# Phase 1 — CI: checks plus image publishing, one job per app.
 #
 # Jobs:
-#   web     - eslint + vitest for frontend and admin (same React + Vite
-#             toolchain, so one matrix covers both)
-#   backend - ruff + pytest
-#   docker  - builds and pushes all three images, only after checks pass
+#   web     - a frontend/admin matrix: eslint + vitest, then docker build+push
+#   backend - ruff + pytest, then docker build+push
 #
-# NOTE: the docker job publishes images, which is CD behaviour. It is separate
-# from the checks so a slow build does not hold up lint and test feedback.
+# Each app's image is built in the same job that checked it, so a lint or test
+# failure never reaches the registry.
 name: CI
 
 on:
@@ -66,6 +64,21 @@ jobs:
       - name: Test (vitest)
         run: npm run test --silent
 
+      - name: Docker login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Docker build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.app }}
+          push: true
+          tags: |
+            ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.app }}:sha-${{ github.sha }}
+            ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.app }}:latest
+
   backend:
     name: Backend
     runs-on: ubuntu-latest
@@ -112,20 +125,6 @@ jobs:
       - name: Test (pytest)
         run: pytest
 
-  # Image publishing, kept separate from the checks so a slow build cannot
-  # hold up lint and test feedback.
-  docker:
-    name: Docker ${{ matrix.folder }}
-    runs-on: ubuntu-latest
-    needs: [web, backend]
-    strategy:
-      fail-fast: false
-      matrix:
-        folder: [backend, frontend, admin]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
       - name: Docker login
         uses: docker/login-action@v3
         with:
@@ -135,8 +134,8 @@ jobs:
       - name: Docker build and push
         uses: docker/build-push-action@v6
         with:
-          context: ./${{ matrix.folder }}
+          context: ./backend
           push: true
           tags: |
-            ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.folder }}:sha-${{ github.sha }}
-            ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.folder }}:latest
+            ${{ vars.DOCKERHUB_USERNAME }}/backend:sha-${{ github.sha }}
+            ${{ vars.DOCKERHUB_USERNAME }}/backend:latest
