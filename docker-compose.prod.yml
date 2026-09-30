@@ -1,81 +1,198 @@
-version: '3.8'
-
-networks:
-  app-network:
-    driver: bridge
-
-volumes:
-  postgres_data:
-  redis_data:
+# Production stack. Deployed by .github/workflows/cd.yml, never by hand.
+#
+#   IMAGE_REGISTRY=snehalpradhan \
+#   IMAGE_TAG=sha-<40-char-sha> \
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Four things differ from docker-compose.yml, and each one is load-bearing:
+#
+#   1. The API service is named `api`, not `backend`. This is not cosmetic.
+#      frontend/Dockerfile and admin/Dockerfile bake the backend address into
+#      the image at BUILD time (the hardened Chainguard runtime has no shell, so
+#      there is no envsubst entrypoint to render it at container start). CI
+#      builds them with the default BACKEND_ADDR=api:8000, so the compose
+#      service has to be called `api` or the baked upstream points at a host
+#      that does not exist. The BACKEND_HOST/BACKEND_PORT env vars below are
+#      accepted by the dev stack and ignored by these two images.
+#
+#   2. Images are pulled by tag, never built here. The point of running tests
+#      in CI is that the artifact which passed them is the artifact that ships.
+#      `pull_policy: always` makes a redeploy of the same tag pick up a re-pushed
+#      image instead of silently reusing a stale local copy. The `build:` keys
+#      are kept only as an escape hatch for building on the host; CI never
+#      passes --build.
+#
+#   3. Both web containers listen on 8080 internally and publish nothing. The
+#      `proxy` service is the only thing with host ports. 8080, not 3000: the
+#      Chainguard nginx images run as non-root 65532, which cannot bind 3000.
+#
+#   4. Every dependency is gated on a health condition, and the schema is
+#      created by the `seed` job before the API starts. Without this the API
+#      crash-loops on a fresh volume until Postgres happens to accept a
+#      connection, and the catalogue smoke check fails on an empty database.
+#
+# Required environment (all in .env on the host, which is gitignored):
+#   IMAGE_REGISTRY  Docker Hub namespace, e.g. snehalpradhan
+#   IMAGE_TAG       immutable tag CI published, normally sha-<git-sha>
+#   DB_PASSWORD     postgres superuser password
+#   DATABASE_URL    full URL for the app. Set separately from DB_PASSWORD
+#                   because a password containing @ : / ? # or % must be
+#                   percent-encoded to survive inside a URL, and
+#                   interpolating the raw value here would produce a URL that
+#                   parses as something else entirely.
+#   SECRET_KEY      >= 32 chars. config.py refuses to boot in production with
+#                   the development placeholder, so this cannot be left unset.
+name: store-prod
 
 services:
-  postgres:
-    image: postgres:15-alpine
-    container_name: prod_postgres
-    restart: always
+  # ------------------------------------------------------------- database --
+  db:
+    image: postgres:16-alpine
     environment:
       POSTGRES_USER: store
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
-      POSTGRES_DB: store_prod
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      POSTGRES_DB: store
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-    networks:
-      - app-network
+      - db_data:/var/lib/postgresql/data
+    # The stock postgres image ships no healthcheck, so declare one. pg_isready
+    # only answers once the server accepts connections, which is genuinely
+    # later than "the container started".
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U store -d store"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
 
+  # ---------------------------------------------------------------- cache --
   redis:
     image: redis:7-alpine
-    container_name: prod_redis
-    restart: always
-    volumes:
-      - redis_data:/data
-    networks:
-      - app-network
+    # Cache only, so there is nothing worth persisting across deploys.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
 
-  backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    container_name: prod_backend
-    restart: always
+  # ------------------------------------------------------------ seed data --
+  # One-shot job: creates the schema and inserts demo data, then exits 0.
+  # Idempotent, so it is safe on every deploy. It runs the same image the API
+  # runs, so the schema comes from the artifact being deployed rather than from
+  # whatever the host's source tree happens to say.
+  seed:
+    image: ${IMAGE_REGISTRY:?set IMAGE_REGISTRY in .env}/backend:${IMAGE_TAG:?set IMAGE_TAG in .env}
+    pull_policy: always
     environment:
-      - ENVIRONMENT=production
-      - SECRET_KEY=${SECRET_KEY}
-      - DATABASE_URL=postgresql+psycopg://store:${DB_PASSWORD}@postgres:5432/store_prod
-      - REDIS_URL=redis://redis:6379/0
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+    # `-m app.seed`, not `python -m app.seed`. This image has
+    # ENTRYPOINT ["/opt/venv/bin/python"], and compose's `command` replaces CMD
+    # rather than ENTRYPOINT - so `python -m app.seed` would expand to
+    # `/opt/venv/bin/python python -m app.seed`, making python search for a file
+    # named `python` and exit 2. The API waits on
+    # service_completed_successfully, so a failed seed takes the whole stack
+    # down rather than shipping an API pointed at a database with no tables.
+    command: ["-m", "app.seed"]
     depends_on:
-      - postgres
-      - redis
-    networks:
-      - app-network
+      db:
+        condition: service_healthy
+    restart: "no"
 
+  # ------------------------------------------------------------------ api --
+  api:
+    image: ${IMAGE_REGISTRY:?set IMAGE_REGISTRY in .env}/backend:${IMAGE_TAG:?set IMAGE_TAG in .env}
+    pull_policy: always
+    environment:
+      ENVIRONMENT: production
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      REDIS_URL: redis://redis:6379/0
+      # Empty is correct here: the browser only ever talks to the proxy origin,
+      # so there is no cross-origin request to permit.
+      CORS_ORIGINS: ""
+    # No `ports`. The API is reachable as `api:8000` on the internal network and
+    # from nowhere else. Publishing it would expose it to the host and the
+    # internet.
+    depends_on:
+      # Wait for the schema to exist, not merely for the database to be up.
+      # This is what stops the API crash-looping on a fresh volume.
+      seed:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    # Declared here rather than baked into the image: the Chainguard python
+    # runtime has no shell and no curl, so it cannot carry a HEALTHCHECK.
+    # Python itself is the probe, the same approach the db service uses. The
+    # proxy waits on this, so it is load-bearing.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ------------------------------------------------------------- storefront --
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    container_name: prod_frontend
-    restart: always
-    networks:
-      - app-network
+    image: ${IMAGE_REGISTRY:?set IMAGE_REGISTRY in .env}/frontend:${IMAGE_TAG:?set IMAGE_TAG in .env}
+    pull_policy: always
+    environment:
+      # Ignored by this image (address baked at build time as `api:8000`); kept
+      # so this file reads consistently with docker-compose.yml.
+      BACKEND_HOST: api
+      BACKEND_PORT: "8000"
+    depends_on:
+      api:
+        condition: service_healthy
+    # No host ports: the proxy is the only way in.
+    restart: unless-stopped
 
+  # ----------------------------------------------------------------- admin --
   admin:
-    build:
-      context: ./admin
-      dockerfile: Dockerfile
-    container_name: prod_admin
-    restart: always
-    networks:
-      - app-network
+    image: ${IMAGE_REGISTRY:?set IMAGE_REGISTRY in .env}/admin:${IMAGE_TAG:?set IMAGE_TAG in .env}
+    pull_policy: always
+    environment:
+      BACKEND_HOST: api
+      BACKEND_PORT: "8000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
 
-  frontend-proxy:
-    image: nginx:alpine
-    container_name: prod_nginx
+  # ----------------------------------------------------------------- proxy --
+  # The only service with host ports. 80 is the storefront, 8081 is the admin
+  # panel.
+  #
+  # The admin panel is on its own port rather than under an /admin/ path prefix
+  # because admin/src/main.jsx uses BrowserRouter with no basename. Mounted
+  # under a prefix, every client-side route would miss and deep links like
+  # /admin/orders would 404. A separate origin keeps the router at path root.
+  proxy:
+    # 1.30.5-alpine, pinned. The previously pinned 1.31.2-alpine does not exist
+    # on Docker Hub - the 1.30.x series is the highest published - so a deploy
+    # asking for it would fail at pull time, not at review time.
+    image: nginx:1.30.5-alpine
     ports:
       - "80:80"
+      - "8081:8081"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      - backend
-      - frontend
-      - admin
-    networks:
-      - app-network
+      frontend:
+        condition: service_started
+      admin:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  db_data:

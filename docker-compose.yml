@@ -51,11 +51,24 @@ services:
   # Idempotent, so it is safe on every `up`. It is a service, not a step.
   seed:
     build: ./backend
+    # The same image the API runs, so the schema is created by the artifact
+    # being deployed rather than by whatever the backend source happens to say.
+    # On a deploy host `up --no-build` means this resolves to the pulled image
+    # and the local build context is ignored; on a dev machine it still builds
+    # from source as before.
+    image: ${IMAGE_REGISTRY:-store}/${IMAGE_NAME:-api}:${IMAGE_TAG:-latest}
     environment:
       DATABASE_URL: postgresql+psycopg://store:store@db:5432/store
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
-    command: ["python", "-m", "app.seed"]
+    # `-m app.seed`, not `python -m app.seed`. This image has
+    # ENTRYPOINT ["/opt/venv/bin/python"], and compose's `command` replaces
+    # CMD rather than ENTRYPOINT - so the full invocation is
+    # `/opt/venv/bin/python python -m app.seed`, which makes python look for a
+    # *file* named `python` and exit 2. The API waits on
+    # `service_completed_successfully`, so a failed seed takes the whole stack
+    # down with it.
+    command: ["-m", "app.seed"]
     depends_on:
       db:
         condition: service_healthy
@@ -64,7 +77,11 @@ services:
   # ------------------------------------------------------------------ api --
   api:
     build: ./backend
-    image: store/api:${IMAGE_TAG:-latest}
+    # IMAGE_REGISTRY/IMAGE_NAME/IMAGE_TAG let a deploy host pull what CI already
+    # published instead of building on the server. CI publishes `backend`, not
+    # `api`, hence IMAGE_NAME; the defaults keep `store/*` so a local
+    # `docker compose up -d --build` is unchanged.
+    image: ${IMAGE_REGISTRY:-store}/${IMAGE_NAME:-api}:${IMAGE_TAG:-latest}
     environment:
       DATABASE_URL: postgresql+psycopg://store:store@db:5432/store
       REDIS_URL: redis://redis:6379/0
@@ -102,7 +119,7 @@ services:
   # ------------------------------------------------------------- storefront --
   frontend:
     build: ./frontend
-    image: store/frontend:${IMAGE_TAG:-latest}
+    image: ${IMAGE_REGISTRY:-store}/frontend:${IMAGE_TAG:-latest}
     environment:
       # The service name is the hostname. No DNS server to configure, no IP to
       # discover, and it stays correct if the api container is replaced.
@@ -118,7 +135,7 @@ services:
   # ----------------------------------------------------------------- admin --
   admin:
     build: ./admin
-    image: store/admin:${IMAGE_TAG:-latest}
+    image: ${IMAGE_REGISTRY:-store}/admin:${IMAGE_TAG:-latest}
     environment:
       BACKEND_HOST: api
       BACKEND_PORT: "8000"
