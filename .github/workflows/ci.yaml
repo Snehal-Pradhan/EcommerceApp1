@@ -1,11 +1,13 @@
-# Phase 1 — CI: lint, test, and build images for frontend, admin, backend.
-# NOTE: the docker push steps publish images. That is CD behaviour; it is here
-# because it was explicitly requested. It is isolated at the end of each job.
+# Phase 1 — CI: checks, then image publishing.
 #
-# frontend and admin are both React + Vite apps with the same toolchain, so they
-# share one job driven by a matrix. backend is Python and stays separate: a
-# matrix across two unrelated toolchains needs more `include:` branching than it
-# saves.
+# Jobs:
+#   web     - eslint + vitest for frontend and admin (same React + Vite
+#             toolchain, so one matrix covers both)
+#   backend - ruff + pytest
+#   docker  - builds and pushes all three images, only after checks pass
+#
+# NOTE: the docker job publishes images, which is CD behaviour. It is separate
+# from the checks so a slow build does not hold up lint and test feedback.
 name: CI
 
 on:
@@ -14,17 +16,10 @@ on:
 permissions:
   contents: read
 
-env:
-  REGISTRY: docker.io
-  IMAGE_PREFIX: ${{ vars.DOCKERHUB_USERNAME }}
-
 jobs:
   web:
     name: ${{ matrix.app }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     strategy:
       # Let every app report its own result instead of cancelling siblings.
       fail-fast: false
@@ -71,37 +66,9 @@ jobs:
       - name: Test (vitest)
         run: npm run test --silent
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          # type=gha cache export is unsupported on the default docker
-          # driver, so Buildx needs a docker-container builder.
-          driver: docker-container
-
-      - name: Docker login
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_PASSWORD }}
-
-      - name: Docker build
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ matrix.app }}
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.app }}:sha-${{ github.sha }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.app }}:latest
-          cache-from: type=gha,scope=${{ matrix.app }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.app }}
-
   backend:
     name: Backend
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     defaults:
       run:
         working-directory: backend
@@ -145,27 +112,31 @@ jobs:
       - name: Test (pytest)
         run: pytest
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          # type=gha cache export is unsupported on the default docker
-          # driver, so Buildx needs a docker-container builder.
-          driver: docker-container
+  # Image publishing, kept separate from the checks so a slow build cannot
+  # hold up lint and test feedback.
+  docker:
+    name: Docker ${{ matrix.folder }}
+    runs-on: ubuntu-latest
+    needs: [web, backend]
+    strategy:
+      fail-fast: false
+      matrix:
+        folder: [backend, frontend, admin]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Docker login
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
 
-      - name: Docker build
+      - name: Docker build and push
         uses: docker/build-push-action@v6
         with:
-          context: backend
+          context: ./${{ matrix.folder }}
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/backend:sha-${{ github.sha }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/backend:latest
-          cache-from: type=gha,scope=backend
-          cache-to: type=gha,mode=max,scope=backend
+            ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.folder }}:sha-${{ github.sha }}
+            ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.folder }}:latest
