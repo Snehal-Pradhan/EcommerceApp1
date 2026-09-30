@@ -1,0 +1,227 @@
+name: CD
+
+# Deploys to EC2 after CI succeeds on main.
+#
+# Transport is AWS Systems Manager, not SSH. Port 22 never has to be open: the
+# instance's SSM agent dials out to the SSM endpoint, and GitHub authenticates
+# with a short-lived OIDC token instead of a permanent private key. EC2_HOST and
+# EC2_SSH_KEY are therefore obsolete and should be deleted from the repo secrets.
+#
+# The alternative - allowing GitHub's runner egress ranges in the security group
+# - is not viable: api.github.com/meta currently lists ~7400 CIDRs for `actions`
+# and AWS caps security group rules at 60 per group by default.
+on:
+  # The normal path: a green CI run on main deploys itself.
+  workflow_run:
+    workflows: ["CI"] # must match the name: in .github/workflows/ci.yaml
+    types:
+      - completed
+    branches:
+      - main
+  # The manual path, for re-deploying a known-good commit without pushing
+  # anything new. A manual run has no `workflow_run` payload at all, so the
+  # conclusion check and the SHA lookup below both have to fall back - see the
+  # job's `if:` and the SHA expression in the deploy step.
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: >-
+          Commit to deploy. Leave empty to deploy the tip of the ref this was
+          dispatched from. Must be a commit that has landed on main.
+        required: false
+        type: string
+
+# `id-token: write` is what lets GitHub mint the OIDC assertion AWS trusts.
+# `contents: read` is the floor and nothing here needs more.
+permissions:
+  contents: read
+  id-token: write
+
+# Do NOT cancel a deploy that is already in flight. Two overlapping runs would
+# race `docker compose up` against each other on one host, and cancelling
+# mid-`up` leaves a half-replaced container set. Serialise instead.
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Only a green CI run on main may deploy unattended. Without this check a
+    # red CI run would push the untested code anyway.
+    #
+    # A manual dispatch is exempt from the conclusion check - there is no
+    # triggering run to have a conclusion - but it is not exempt from review:
+    # the script still refuses any commit that has not landed on main.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Assume the deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Deploy over SSM
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          # The commit to deploy, resolved for both trigger paths:
+          #   workflow_run       -> the commit CI actually tested. `git pull
+          #                         origin main` would deploy whatever is at the
+          #                         tip, which is a different commit whenever a
+          #                         push lands mid-deploy.
+          #   workflow_dispatch  -> the `sha` input if given, else the tip of
+          #                         the ref the run was dispatched from.
+          # GitHub expression `||` returns the first truthy operand, and an
+          # empty string is falsy, so an empty input falls through correctly.
+          SHA: ${{ github.event.inputs.sha || github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Catch a typo'd or truncated sha here rather than letting it reach
+          # `git checkout`, where the failure would read as a git error instead
+          # of "you typed the wrong thing".
+          if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::resolved SHA is not a 40-character commit id: '${SHA}'"
+            exit 1
+          fi
+
+          # The remote script travels as base64 in a single SSM command. SSM runs
+          # each entry of `commands` as its own shell, so a multi-line script
+          # sent line by line would lose every variable between lines; and
+          # base64 sidesteps the three layers of quoting between this heredoc,
+          # the JSON parameter blob, and the remote shell.
+          cat > /tmp/deploy.sh <<'DEPLOY_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          APP_DIR=/home/ubuntu/my-app
+          SHA="${DEPLOY_SHA}"
+          IMAGE_TAG="sha-${SHA}"
+
+          cd "$APP_DIR"
+
+          # The old image tags are removed after the new containers are up, not
+          # before, so a failure part-way through leaves the previous release
+          # running and the previous tag still on disk to roll back to.
+          echo "==> recording the currently live tag for rollback"
+          mkdir -p .deploy-state
+          prev="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.image" }}' \
+            store-prod-api-1 2>/dev/null | sed 's/.*://' || true)"
+          if [ -n "$prev" ]; then
+            echo "$prev" > .deploy-state/previous-tag
+            echo "    previous live tag: $prev"
+          fi
+
+          echo "==> checking out $SHA"
+          git fetch --quiet --all --tags --prune
+          # Only code that has actually landed on main may reach production.
+          # This is what makes workflow_dispatch safe: dispatching from a
+          # feature branch, or pasting a commit that only exists on someone's
+          # laptop, stops here instead of deploying. An older main commit still
+          # passes, which is what makes it useful for rollbacks.
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "FATAL: $SHA has not landed on main. Refusing to deploy it." >&2
+            exit 1
+          fi
+          git checkout --quiet --detach "$SHA"
+          git rev-parse HEAD
+
+          echo "==> verifying host prerequisites"
+          test -f .env || {
+            echo "FATAL: $APP_DIR/.env is missing. It must define IMAGE_REGISTRY," >&2
+            echo "       DB_PASSWORD, DATABASE_URL and SECRET_KEY (>= 32 chars)." >&2
+            exit 1
+          }
+          command -v docker >/dev/null || { echo "FATAL: docker not on PATH" >&2; exit 1; }
+
+          echo "==> pulling images for $IMAGE_TAG"
+          # .env first, then the tag. The order matters: sourcing .env after
+          # exporting would let a stale IMAGE_TAG left in that file silently
+          # override the SHA this deploy was actually gated on, and the next
+          # `up` would happily redeploy the previous release.
+          set -a; . ./.env; set +a
+          export IMAGE_TAG="sha-${SHA}"
+          echo "    IMAGE_REGISTRY=${IMAGE_REGISTRY:-<unset>}"
+          echo "    IMAGE_TAG=${IMAGE_TAG}"
+          docker compose -f docker-compose.prod.yml pull
+
+          echo "==> starting the new release"
+          # No --build: these are the images CI built, tested and scanned.
+          docker compose -f docker-compose.prod.yml up -d --remove-orphans --wait --wait-timeout 300
+
+          echo "==> recording the live tag"
+          echo "$IMAGE_TAG" > .deploy-state/live-tag
+
+          echo "==> smoke test"
+          chmod +x ./scripts/smoke.sh
+          ./scripts/smoke.sh http://localhost
+          ./scripts/smoke.sh http://localhost:8081
+
+          echo "==> pruning dangling images"
+          docker image prune -f --filter "until=168h" >/dev/null
+
+          echo "DEPLOY OK $IMAGE_TAG"
+          DEPLOY_SCRIPT
+
+          B64="$(base64 < /tmp/deploy.sh | tr -d '\n')"
+
+          echo "Sending deploy command to instance ${INSTANCE_ID}"
+          CMD_ID="$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --parameters "{\"commands\":[\"DEPLOY_SHA=${SHA} bash -c 'echo ${B64} | base64 -d | bash'\"]}" \
+            --query 'Command.CommandId' \
+            --output text)"
+
+          echo "Command id: $CMD_ID"
+
+          # Poll until the command reaches a terminal state. 20 min ceiling
+          # matches the job timeout, so the job fails on its own if SSM stalls
+          # and we never wait forever on a command that will never report.
+          DEADLINE=$((SECONDS + 1080))
+          while :; do
+            INVOCATION="$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query '{status:Status,out:StandardOutputContent,err:StandardErrorContent}' \
+              --output json)"
+            STATUS="$(printf '%s' "$INVOCATION" | jq -r .status)"
+
+            case "$STATUS" in
+              Pending|InProgress|Scheduled|Cancelling)
+                printf '  %s [%ss]\n' "$STATUS" "$SECONDS"
+                sleep 15
+                ;;
+              *)
+                break
+                ;;
+            esac
+
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "::error::timed out waiting for SSM command ${CMD_ID}"
+              aws ssm list-commands --command-id "$CMD_ID" --output json || true
+              exit 1
+            fi
+          done
+
+          echo "----- stdout -----"
+          printf '%s' "$INVOCATION" | jq -r '.out // ""'
+          echo "----- stderr -----"
+          printf '%s' "$INVOCATION" | jq -r '.err // ""'
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::deploy failed on the instance (SSM status: ${STATUS})"
+            exit 1
+          fi
+
+          {
+            echo "## Deploy"
+            echo "- Commit: \`${SHA}\`"
+            echo "- Image tag: \`${IMAGE_TAG}\`"
+            echo "- Result: ${STATUS}"
+          } >> "$GITHUB_STEP_SUMMARY"

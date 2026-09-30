@@ -12,3 +12,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Runtime state that exists only on a deploy host. `.env` holds SECRET_KEY and
+# is required by compose; `.deploy-state/` records which tag is live so a
+# rollback has something to roll back to. Neither belongs in git.
+.env
+.deploy-state/
+
