@@ -1,14 +1,35 @@
 # syntax=docker/dockerfile:1
 #
-# The frontend compiled down to static files and threw Node away. This is the
-# opposite shape: the app keeps running, so the runtime needs a Python
-# interpreter - but not pip, not a compiler, and not the source of the
-# dependencies. The venv is copied as a self-contained unit.
+# EXPERIMENT (now adopted): hardened runtime, same idea as the web apps.
+# The builder is Chainguard's -dev variant (it has a shell and pip, same
+# Python 3.14 as the runtime); the runtime is the minimal variant: no shell,
+# no package manager, non-root 65532.
+#
+# What "no shell in the runtime" costs here - each is worked around below:
+#
+#   1. No RUN in the runtime stage. So: no useradd (the image's own 65532
+#      user is used), no `mkdir uploads` (the directory is created in the
+#      builder and copied with the right ownership).
+#   2. No `sh -c`, so the CMD cannot expand ${PORT}. A python -c one-liner
+#      reads the environment instead, keeping the "PORT comes from the
+#      environment, never hardcoded" rule (Elastic Beanstalk sets PORT=80).
+#   3. No curl, so no in-image HEALTHCHECK. The healthcheck moves to the
+#      platform: docker-compose.yml now declares one for the api service,
+#      same as it already did for db.
+#   4. The venv is built by -dev, whose /usr/bin/python3.14 is the same
+#      binary the runtime has, so the venv's symlinks resolve.
+#   5. cgr.dev/chainguard/python:latest is a MUTABLE tag (free tier), like
+#      the web images.
 
-ARG PYTHON_IMAGE=python:3.12-slim
+ARG PYTHON_IMAGE=cgr.dev/chainguard/python:latest-dev
+ARG RUNTIME_IMAGE=cgr.dev/chainguard/python:latest
 
 # ----------------------------------------------------------------- builder --
 FROM ${PYTHON_IMAGE} AS builder
+
+# The -dev image defaults to the non-root 65532, who cannot write /opt. This
+# is a build stage: it runs as root, installs into /opt, and is thrown away.
+USER root
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
@@ -21,36 +42,27 @@ COPY requirements.txt .
 # A venv rather than system site-packages, so the runtime stage copies one
 # self-contained directory instead of reconstructing an environment.
 #
-# No compiler is installed here and none is needed: every pin resolves to a
-# manylinux wheel - psycopg-binary bundles its own libpq, bcrypt ships prebuilt
-# hashes. If a future pin stops having a wheel, this is the stage that gains
-# build-essential and libpq-dev, never the runtime stage.
+# No compiler is needed: every pin resolves to a wheel - psycopg-binary
+# bundles its own libpq, bcrypt ships prebuilt hashes. Verified against
+# Chainguard's Python 3.14.
 #
-# pip is deleted in the same layer. It costs ~13 MB and a package installer is
-# not something a running server should carry.
+# pip is deleted in the same layer. A package installer is not something a
+# running server should carry.
 RUN python -m venv /opt/venv \
  && /opt/venv/bin/pip install --upgrade pip \
  && /opt/venv/bin/pip install -r requirements.txt \
  && rm -rf /opt/venv/lib/python*/site-packages/pip* /opt/venv/bin/pip*
 
+# Runtime has no shell, so this directory cannot be created there. The
+# placeholder file is copied along; it is inert.
+RUN mkdir -p /srv/uploads && touch /srv/uploads/.keep
+
 # ----------------------------------------------------------------- runtime --
-FROM ${PYTHON_IMAGE} AS runtime
+FROM ${RUNTIME_IMAGE} AS runtime
 
 LABEL org.opencontainers.image.title="store-api" \
       org.opencontainers.image.description="FastAPI backend: catalogue, cart, orders, admin" \
       org.opencontainers.image.source="https://github.com/Snehal-Pradhan/Ecom-demo-app"
-
-# curl exists only for the HEALTHCHECK. A python -c urllib one-liner would drop
-# the binary and its CVEs at the cost of readability.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends curl \
- && rm -rf /var/lib/apt/lists/*
-
-# Debian, not Alpine, so this is useradd/groupadd rather than busybox adduser.
-# Alpine would be ~10 MB smaller but needs musl wheels, and "worked on Debian,
-# broke on Alpine" is a recurring class of bug.
-RUN groupadd --system --gid 1001 app \
- && useradd --system --uid 1001 --gid app --create-home --shell /usr/sbin/nologin app
 
 COPY --from=builder /opt/venv /opt/venv
 
@@ -63,24 +75,32 @@ ENV PATH="/opt/venv/bin:$PATH" \
 
 WORKDIR /srv
 # Only app/ is copied. Tests, .venv, and caches never enter the image.
-COPY --chown=app:app app ./app
+# 65532 is the image's built-in non-root user; --chown replaces the
+# useradd+chown steps the no-shell runtime cannot perform.
+COPY --chown=65532:65532 app ./app
 
 # The app writes uploaded images here. Under a read-only root filesystem this is
 # the one path that has to be a mounted volume.
-RUN mkdir -p /srv/uploads && chown app:app /srv/uploads
+COPY --from=builder --chown=65532:65532 /srv/uploads /srv/uploads
 
-USER app
 EXPOSE 8000
 
 # /health, not /ready. Readiness queries the database, and a health check that
 # fails on a dependency makes the orchestrator restart every healthy API
 # container at once - turning a brief database blip into a full outage that also
 # hammers the database with a reconnect storm on the way up.
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1
+#
+# The healthcheck itself is declared in docker-compose.yml: this image has no
+# shell and no curl, so it cannot carry one, but every service that depends on
+# the api (frontend, admin) waits on compose's condition: service_healthy.
 
 # PORT comes from the environment, never hardcoded: Elastic Beanstalk sets
 # PORT=80 and routes to whatever port the app listens on, so a hardcoded 8000
-# works locally and 502s on EB. `exec` keeps uvicorn as PID 1 so it receives
-# SIGTERM directly and drains in-flight requests on stop.
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]
+# works locally and 502s on EB. Without a shell the environment cannot be
+# expanded in CMD, so uvicorn is started from python, which can read it.
+#
+# The base image's entrypoint is /usr/bin/python, which cannot see the venv's
+# site-packages. The entrypoint is replaced with the venv's own interpreter -
+# same /usr/bin/python3.14 binary underneath, but with the venv activated.
+ENTRYPOINT ["/opt/venv/bin/python"]
+CMD ["-c", "import os, uvicorn; uvicorn.run('app.main:app', host='0.0.0.0', port=int(os.environ.get('PORT', '8000')))"]

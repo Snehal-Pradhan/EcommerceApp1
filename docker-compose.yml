@@ -79,7 +79,24 @@ services:
         condition: service_healthy
     # No `ports`. The API is reachable as `api:8000` from the network and from
     # nowhere else. Publishing it would expose it to the host and the internet.
-    # Its healthcheck comes from the image, so every environment inherits it.
+    #
+    # The healthcheck is declared here rather than baked into the image: the
+    # image is hardened (Chainguard python) and carries no shell and no curl.
+    # Python itself is the probe, same approach the db service already uses
+    # for its image-declared check. frontend and admin wait on
+    # service_healthy below, so this block is load-bearing, not decoration.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 
   # ------------------------------------------------------------- storefront --
