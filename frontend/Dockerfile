@@ -10,7 +10,7 @@
 # build args, not copy-paste that drifts.
 
 ARG NODE_IMAGE=node:22.23.3-alpine3.24
-ARG NGINX_IMAGE=nginx:1.27-alpine
+ARG NGINX_IMAGE=nginx:1.31.2-alpine
 
 # ----------------------------------------------------------------- builder --
 FROM ${NODE_IMAGE} AS builder
