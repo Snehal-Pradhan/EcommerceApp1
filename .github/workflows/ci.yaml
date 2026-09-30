@@ -20,12 +20,18 @@ permissions:
 
 jobs:
   web:
-    name: ${{ matrix.app }}
+    # matrix.app is the lowercase folder name used in paths; matrix.label is
+    # only for display. Directory names are case-sensitive on the runner.
+    name: ${{ matrix.label }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        app: [Frontend, Admin]
+        include:
+          - app: frontend
+            label: Frontend
+          - app: admin
+            label: Admin
     defaults:
       run:
         working-directory: ${{ matrix.app }}
