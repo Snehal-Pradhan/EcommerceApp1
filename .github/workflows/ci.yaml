@@ -105,6 +105,14 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.app }}
           cache-to: type=gha,mode=max,scope=${{ matrix.app }}
 
+      - name: Scan image for CVEs
+        uses: aquasecurity/trivy-action@0.33.0
+        with:
+          image-ref: ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.app }}:sha-${{ github.sha }}
+          severity: CRITICAL
+          exit-code: 1
+          ignore-unfixed: true
+
       - name: Job summary
         if: always()
         run: |
@@ -184,6 +192,14 @@ jobs:
             ${{ vars.DOCKERHUB_USERNAME }}/backend:latest
           cache-from: type=gha,scope=backend
           cache-to: type=gha,mode=max,scope=backend
+
+      - name: Scan image for CVEs
+        uses: aquasecurity/trivy-action@0.33.0
+        with:
+          image-ref: ${{ vars.DOCKERHUB_USERNAME }}/backend:sha-${{ github.sha }}
+          severity: CRITICAL
+          exit-code: 1
+          ignore-unfixed: true
 
       - name: Job summary
         if: always()
