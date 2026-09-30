@@ -18,12 +18,20 @@ on:
 permissions:
   contents: read
 
+# A new push to the same branch supersedes the run in flight; cancel it
+# instead of paying for both. Runs on different branches never collide.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   web:
     # matrix.app is the lowercase folder name used in paths; matrix.label is
     # only for display. Directory names are case-sensitive on the runner.
     name: ${{ matrix.label }}
     runs-on: ubuntu-latest
+    # A hung step otherwise burns minutes for 6 hours.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -88,9 +96,19 @@ jobs:
             ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.app }}:sha-${{ github.sha }}
             ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.app }}:latest
 
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## ${{ matrix.label }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Lint: ${{ steps.lint.outputs.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.app }}:sha-${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.app }}:latest" >> "$GITHUB_STEP_SUMMARY"
+
   backend:
     name: Backend
     runs-on: ubuntu-latest
+    # A hung step otherwise burns minutes for 6 hours.
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: backend
@@ -148,3 +166,11 @@ jobs:
           tags: |
             ${{ vars.DOCKERHUB_USERNAME }}/backend:sha-${{ github.sha }}
             ${{ vars.DOCKERHUB_USERNAME }}/backend:latest
+
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## Backend" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Lint: ${{ steps.lint.outputs.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: ${{ vars.DOCKERHUB_USERNAME }}/backend:sha-${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: ${{ vars.DOCKERHUB_USERNAME }}/backend:latest" >> "$GITHUB_STEP_SUMMARY"
